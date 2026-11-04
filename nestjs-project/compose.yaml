@@ -1,6 +1,6 @@
 services:
   nestjs-api:
-    build: 
+    build:
       context: .
       dockerfile: Dockerfile.dev
     ports:
@@ -12,6 +12,10 @@ services:
         condition: service_healthy
       mailpit:
         condition: service_started
+      redis:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
 
   db:
     image: postgres:17
@@ -33,4 +37,77 @@ services:
       - "1025:1025"
       - "8025:8025"
 
+  # Object storage (S3-compatible). Community fork image pinned by release tag —
+  # the upstream minio/minio image is no longer published (phase-03-videos/TD-10).
+  minio:
+    image: pgsty/minio:RELEASE.2026-08-04T00-00-00Z
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      - MINIO_ROOT_USER=${S3_ACCESS_KEY:-streamtube}
+      - MINIO_ROOT_PASSWORD=${S3_SECRET_KEY:-streamtube-secret}
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
 
+  # One-shot provisioning: private bucket for video files and thumbnails
+  # (phase-03-videos/TD-08). Incomplete multipart uploads are expired by MinIO's
+  # built-in stale-upload cleanup (api.stale_uploads_expiry=24h).
+  minio-init:
+    image: pgsty/mc:RELEASE.2026-10-26T00-00-00Z
+    depends_on:
+      minio:
+        condition: service_healthy
+    environment:
+      - S3_ACCESS_KEY=${S3_ACCESS_KEY:-streamtube}
+      - S3_SECRET_KEY=${S3_SECRET_KEY:-streamtube-secret}
+      - S3_BUCKET=${S3_BUCKET:-streamtube-videos}
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 $$S3_ACCESS_KEY $$S3_SECRET_KEY &&
+      mc mb --ignore-existing local/$$S3_BUCKET &&
+      mc anonymous set none local/$$S3_BUCKET
+      "
+
+  # Message broker for the video-processing queue (phase-03-videos/TD-01).
+  redis:
+    image: redis:8.8
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # Video worker (phase-03-videos/TD-03): same image and source as the API,
+  # separate process consuming the video-processing queue with FFmpeg.
+  # Requires dependencies installed once via `docker compose exec nestjs-api npm install`.
+  video-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    command: ["npm", "run", "start:worker:dev"]
+    volumes:
+      - .:/home/node/app
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      minio-init:
+        condition: service_completed_successfully
+
+volumes:
+  minio-data:
+  redis-data:
