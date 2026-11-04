@@ -20,11 +20,22 @@ See `docs/diagrams/software-arch.mermaid` for the full diagram. Key containers:
 
 - **Frontend** (Next.js) → calls API via REST, streams from Object Storage
 - **API** (Nest.js) → business rules, auth, reads/writes DB, uploads to storage, publishes jobs to queue, sends emails
-- **Video Worker** (FFmpeg) → consumes jobs from queue, processes videos, updates DB and storage
+- **Video Worker** (FFmpeg) → consumes jobs from queue, processes videos, updates DB and storage — implemented in Phase 03 as the `video-worker` Compose service (same `nestjs-project/` codebase, entrypoint `src/worker.ts`)
 - **Database** (PostgreSQL) → users, channels, videos, comments, likes
-- **Object Storage** (S3/MinIO) → video files and thumbnails
-- **Message Queue** (TBD) → video processing job queue
+- **Object Storage** (S3/MinIO) → video files and thumbnails — MinIO locally (`minio` service, community image `pgsty/minio`), AWS S3 in production
+- **Message Queue** (BullMQ + Redis) → video processing job queue (`redis` service, queue `video-processing`)
 - **Email Service** (SMTP) → account confirmation and password recovery
+
+## Videos (Phase 03)
+
+Implemented in `nestjs-project/` — see `nestjs-project/CLAUDE.md` → "Videos" for endpoints, services and commands, and `docs/phases/phase-03-videos/` for the plan and decisions.
+
+- **Upload (up to 10 GB) never passes through the API:** `POST /videos` pre-registers the video as `draft` and returns presigned S3 multipart `UploadPart` URLs; the client PUTs each part directly to the object storage, can resume with `GET /videos/:publicId/upload`, and finishes with `POST /videos/:publicId/upload/complete`.
+- **Processing is asynchronous:** completing the upload sets the status to `processing` and publishes a `process-video` job; the worker runs ffprobe/ffmpeg over a presigned URL (no local copy of the file), stores `duration_seconds`, `metadata` and a JPEG thumbnail, and sets `ready` — or `failed` after the 3rd attempt.
+- **Status lifecycle:** `draft → processing → ready | failed` (column `videos.status`).
+- **Unique URL:** every video has an 11-char base64url `public_id` (unique index) used in all video routes.
+- **Streaming / download:** public `GET /videos/:publicId/stream` and `/download` redirect (302) to short-lived presigned URLs; the storage answers `Range` requests with `206 Partial Content`.
+- **Storage endpoints:** server-side code uses `S3_ENDPOINT` (`http://minio:9000`, Compose service name); `S3_PUBLIC_ENDPOINT` (`http://localhost:9000`) is used only to sign URLs handed to clients outside Docker.
 
 ## Docker Networking
 
